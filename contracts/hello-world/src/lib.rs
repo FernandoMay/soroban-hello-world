@@ -1,8 +1,8 @@
 #![no_std]
-use soroban_sdk::{contract, contractimpl, contracttype, Env, String, Address, BytesN, Bytes, Vec};
+use soroban_sdk::{contract, contractimpl, contracttype, Env, String, Address, BytesN, Bytes};
 
 // Savia Smart Contracts for Stellar
-// Fixed version compatible with Soroban
+// Fixed version compatible with Soroban SDK
 
 // ========== DATA STRUCTURES ==========
 
@@ -114,6 +114,13 @@ pub enum SaviaError {
     NotApproved = 10,
 }
 
+// Implement From trait for SaviaError to work with Soroban SDK
+impl From<SaviaError> for soroban_sdk::Error {
+    fn from(e: SaviaError) -> Self {
+        soroban_sdk::Error::from_contract_error(e as u32)
+    }
+}
+
 // ========== MAIN CONTRACT ==========
 
 #[contract]
@@ -166,10 +173,11 @@ impl SaviaContract {
         let current_time = env.ledger().timestamp();
         let mut hash_input = Bytes::new(&env);
         
-        // Convert Address to bytes properly - use Vec<u8> approach
-        let beneficiary_str = beneficiary.to_string();
-        let beneficiary_bytes = Bytes::from_slice(&env, beneficiary_str.as_str().as_bytes());
-        let title_bytes = Bytes::from_slice(&env, title.to_string().as_str().as_bytes());
+        // Convert Address to bytes properly
+        let beneficiary_bytes = Bytes::from_slice(&env, beneficiary.to_string().as_bytes());
+        let title_bytes = Bytes::from_slice(&env, title.to_string().as_bytes());
+        
+        // Convert u64 to bytes properly
         
         hash_input.append(&beneficiary_bytes);
         hash_input.append(&title_bytes);
@@ -177,7 +185,7 @@ impl SaviaContract {
         hash_input.append(&Bytes::from_slice(&env, &current_time.to_be_bytes()));
         hash_input.append(&Bytes::from_slice(&env, &new_counter.to_be_bytes()));
         
-        let campaign_id = env.crypto().sha256(&hash_input);
+        let campaign_id = env.crypto().sha256(&hash_input).into();
 
         let end_time = current_time + (duration_days * 24 * 60 * 60); // Convert to seconds
 
@@ -212,7 +220,7 @@ impl SaviaContract {
         campaign_id: BytesN<32>,
         trust_score: u32,
     ) -> Result<(), SaviaError> {
-        let mut campaign: Campaign = env.storage().persistent().get(&DataKey::Campaign(campaign_id))
+        let mut campaign: Campaign = env.storage().persistent().get(&DataKey::Campaign(campaign_id.clone()))
             .ok_or(SaviaError::CampaignNotFound)?;
 
         campaign.verified = true;
@@ -232,7 +240,7 @@ impl SaviaContract {
         mint_nft: bool,
     ) -> Result<BytesN<32>, SaviaError> {
         // Validate campaign exists and is active
-        let mut campaign: Campaign = env.storage().persistent().get(&DataKey::Campaign(campaign_id))
+        let mut campaign: Campaign = env.storage().persistent().get(&DataKey::Campaign(campaign_id.clone()))
             .ok_or(SaviaError::CampaignNotFound)?;
 
         let current_time = env.ledger().timestamp();
@@ -259,8 +267,7 @@ impl SaviaContract {
         
         // Convert to bytes properly
         let campaign_bytes = Bytes::from_slice(&env, campaign_id.to_array().as_slice());
-        let donor_str = donor.to_string();
-        let donor_bytes = Bytes::from_slice(&env, donor_str.as_str().as_bytes());
+        let donor_bytes = Bytes::from_slice(&env, donor.to_string().as_bytes());
         
         hash_input.append(&campaign_bytes);
         hash_input.append(&donor_bytes);
@@ -268,7 +275,7 @@ impl SaviaContract {
         hash_input.append(&Bytes::from_slice(&env, &current_time.to_be_bytes()));
         hash_input.append(&Bytes::from_slice(&env, &new_counter.to_be_bytes()));
         
-        let donation_id = env.crypto().sha256(&hash_input);
+        let donation_id = env.crypto().sha256(&hash_input).into();
 
         // Create donation record
         let donation = Donation {
@@ -375,8 +382,7 @@ impl SaviaContract {
         // Generate NFT ID
         let mut hash_input = Bytes::new(&env);
         
-        let owner_str = owner.to_string();
-        let owner_bytes = Bytes::from_slice(&env, owner_str.as_str().as_bytes());
+        let owner_bytes = Bytes::from_slice(&env, owner.to_string().as_bytes());
         let campaign_bytes = Bytes::from_slice(&env, campaign_id.to_array().as_slice());
         let donation_bytes = Bytes::from_slice(&env, donation_id.to_array().as_slice());
         
@@ -386,7 +392,7 @@ impl SaviaContract {
         hash_input.append(&Bytes::from_slice(&env, &amount.to_be_bytes()));
         hash_input.append(&Bytes::from_slice(&env, &new_counter.to_be_bytes()));
         
-        let nft_id = env.crypto().sha256(&hash_input);
+        let nft_id = env.crypto().sha256(&hash_input).into();
 
         // Determine badge type based on amount
         let badge_type = Self::get_badge_type(&env, amount);
@@ -433,9 +439,8 @@ impl SaviaContract {
         let mut hash_input = Bytes::new(&env);
         
         let campaign_bytes = Bytes::from_slice(&env, campaign_id.to_array().as_slice());
-        let recipient_str = recipient.to_string();
-        let recipient_bytes = Bytes::from_slice(&env, recipient_str.as_str().as_bytes());
-        let milestone_bytes = Bytes::from_slice(&env, milestone.to_string().as_str().as_bytes());
+        let recipient_bytes = Bytes::from_slice(&env, recipient.to_string().as_bytes());
+        let milestone_bytes = Bytes::from_slice(&env, milestone.as_bytes());
         
         hash_input.append(&campaign_bytes);
         hash_input.append(&recipient_bytes);
@@ -443,7 +448,7 @@ impl SaviaContract {
         hash_input.append(&milestone_bytes);
         hash_input.append(&Bytes::from_slice(&env, &new_counter.to_be_bytes()));
         
-        let disbursement_id = env.crypto().sha256(&hash_input);
+        let disbursement_id = env.crypto().sha256(&hash_input).into();
 
         let disbursement = Disbursement {
             id: disbursement_id,
@@ -465,7 +470,7 @@ impl SaviaContract {
         env: Env,
         disbursement_id: BytesN<32>,
     ) -> Result<(), SaviaError> {
-        let mut disbursement: Disbursement = env.storage().persistent().get(&DataKey::Disbursement(disbursement_id))
+        let mut disbursement: Disbursement = env.storage().persistent().get(&DataKey::Disbursement(disbursement_id.clone()))
             .ok_or(SaviaError::DisbursementNotFound)?;
 
         if disbursement.status != DisbursementStatus::Approved {
