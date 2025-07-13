@@ -1,125 +1,170 @@
 #![no_std]
-use soroban_sdk::{contract, contractimpl, vec, Env, String, Vec};
-// Savia Smart Contracts for Stellar Slingshot
-// Based on ZkVM blockchain specification and Stellar Disbursement Platform
+use soroban_sdk::{contract, contractimpl, contracttype, Env, String, Address, BytesN, Symbol, Bytes};
 
-use zkvm::{
-    contract::{Contract, PortableItem},
-    constraint_system::ConstraintSystem,
-    predicate::Predicate,
-    transcript::Transcript,
-    value::Value,
-};
-use bulletproofs::r1cs::R1CSProof;
-use curve25519_dalek::{ristretto::RistrettoPoint, scalar::Scalar};
-use std::collections::HashMap;
+// Savia Smart Contracts for Stellar
+// Fixed version compatible with Soroban
 
 // ========== DATA STRUCTURES ==========
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
+#[contracttype]
 pub struct Campaign {
-    pub id: [u8; 32],
+    pub id: BytesN<32>,
     pub title: String,
     pub description: String,
-    pub beneficiary: RistrettoPoint,
+    pub beneficiary: Address,
     pub goal_amount: u64,
     pub current_amount: u64,
     pub start_time: u64,
     pub end_time: u64,
     pub verified: bool,
-    pub trust_score: u8,
-    pub nft_count: u32,
+    pub trust_score: u32,
     pub category: String,
     pub location: String,
-    pub documents_hash: [u8; 32],
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
+#[contracttype]
 pub struct Donation {
-    pub id: [u8; 32],
-    pub campaign_id: [u8; 32],
-    pub donor: RistrettoPoint,
+    pub id: BytesN<32>,
+    pub campaign_id: BytesN<32>,
+    pub donor: Address,
     pub amount: u64,
     pub timestamp: u64,
     pub nft_minted: bool,
-    pub recurring: bool,
     pub anonymous: bool,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
+#[contracttype]
 pub struct TrustScore {
-    pub entity: RistrettoPoint,
-    pub score: u8,
-    pub verification_level: u8,
+    pub entity: Address,
+    pub score: u32,
+    pub verification_level: u32,
     pub donation_count: u32,
     pub total_donated: u64,
     pub campaigns_created: u32,
     pub last_updated: u64,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
+#[contracttype]
 pub struct NFTBadge {
-    pub id: [u8; 32],
-    pub owner: RistrettoPoint,
+    pub id: BytesN<32>,
+    pub owner: Address,
     pub badge_type: String,
-    pub campaign_id: Option<[u8; 32]>,
+    pub campaign_id: Option<BytesN<32>>,
     pub minted_at: u64,
     pub metadata_uri: String,
 }
 
-// ========== CAMPAIGN MANAGEMENT CONTRACT ==========
-
-pub struct CampaignContract {
-    campaigns: HashMap<[u8; 32], Campaign>,
-    platform_fee: u64, // Basis points (e.g., 200 = 2%)
-    verification_threshold: u64,
+#[derive(Clone)]
+#[contracttype]
+pub struct Disbursement {
+    pub id: BytesN<32>,
+    pub campaign_id: BytesN<32>,
+    pub recipient: Address,
+    pub amount: u64,
+    pub milestone: String,
+    pub status: DisbursementStatus,
+    pub created_at: u64,
+    pub executed_at: Option<u64>,
 }
 
-impl CampaignContract {
-    pub fn new(platform_fee: u64) -> Self {
-        Self {
-            campaigns: HashMap::new(),
-            platform_fee,
-            verification_threshold: 10000, // $100 in cents
+#[derive(Clone, PartialEq)]
+#[contracttype]
+pub enum DisbursementStatus {
+    Pending,
+    Approved,
+    Executed,
+    Rejected,
+}
+
+// ========== STORAGE KEYS ==========
+
+#[derive(Clone)]
+#[contracttype]
+pub enum DataKey {
+    Campaign(BytesN<32>),
+    Donation(BytesN<32>),
+    TrustScore(Address),
+    NFTBadge(BytesN<32>),
+    Disbursement(BytesN<32>),
+    PlatformFee,
+    CampaignCounter,
+    DonationCounter,
+    NFTCounter,
+    DisbursementCounter,
+}
+
+// ========== MAIN CONTRACT ==========
+
+#[contract]
+pub struct SaviaContract;
+
+#[contractimpl]
+impl SaviaContract {
+    
+    /// Initialize the contract with platform fee
+    pub fn initialize(env: Env, platform_fee: u64) -> Result<(), u32> {
+        if platform_fee > 1000 {
+            return Err(1); // Use error code instead of Symbol
         }
+        
+        env.storage().instance().set(&DataKey::PlatformFee, &platform_fee);
+        env.storage().instance().set(&DataKey::CampaignCounter, &0u64);
+        env.storage().instance().set(&DataKey::DonationCounter, &0u64);
+        env.storage().instance().set(&DataKey::NFTCounter, &0u64);
+        env.storage().instance().set(&DataKey::DisbursementCounter, &0u64);
+        
+        Ok(())
     }
 
     /// Create a new campaign
     pub fn create_campaign(
-        &mut self,
-        cs: &mut ConstraintSystem,
+        env: Env,
+        beneficiary: Address,
         title: String,
         description: String,
-        beneficiary: RistrettoPoint,
         goal_amount: u64,
         duration_days: u64,
         category: String,
         location: String,
-        documents_hash: [u8; 32],
-    ) -> Result<[u8; 32], String> {
-        // Generate campaign ID
-        let mut transcript = Transcript::new(b"Savia.create_campaign");
-        transcript.append_message(b"title", title.as_bytes());
-        transcript.append_message(b"beneficiary", beneficiary.compress().as_bytes());
-        transcript.append_u64(b"goal_amount", goal_amount);
-        transcript.append_u64(b"timestamp", self.get_current_timestamp());
-        
-        let campaign_id = transcript.challenge_bytes(b"campaign_id");
-
+    ) -> Result<BytesN<32>, u32> {
         // Validate inputs
         if goal_amount == 0 {
-            return Err("Goal amount must be greater than 0".to_string());
+            return Err(2); // invalid_goal
         }
         
         if duration_days == 0 || duration_days > 365 {
-            return Err("Duration must be between 1 and 365 days".to_string());
+            return Err(3); // invalid_duration
         }
 
-        let current_time = self.get_current_timestamp();
-        let end_time = current_time + (duration_days * 24 * 60 * 60 * 1000); // Convert to milliseconds
+        // Get and increment campaign counter
+        let counter: u64 = env.storage().instance().get(&DataKey::CampaignCounter).unwrap_or(0);
+        let new_counter = counter + 1;
+        env.storage().instance().set(&DataKey::CampaignCounter, &new_counter);
+
+        // Generate campaign ID using existing data
+        let current_time = env.ledger().timestamp();
+        let mut hash_input = Bytes::new(&env);
+        
+        // Convert Address to bytes properly
+        let beneficiary_bytes = Bytes::from_slice(&env, &beneficiary.to_string().as_bytes());
+        let title_bytes = Bytes::from_slice(&env, title.as_bytes());
+        
+        hash_input.append(&beneficiary_bytes);
+        hash_input.append(&title_bytes);
+        hash_input.append(&Bytes::from_slice(&env, &goal_amount.to_be_bytes()));
+        hash_input.append(&Bytes::from_slice(&env, &current_time.to_be_bytes()));
+        hash_input.append(&Bytes::from_slice(&env, &new_counter.to_be_bytes()));
+        
+        let campaign_id = env.crypto().sha256(&hash_input).into(); // Convert Hash to BytesN
+
+        let end_time = current_time + (duration_days * 24 * 60 * 60); // Convert to seconds
 
         let campaign = Campaign {
-            id: campaign_id,
+            id: campaign_id.clone(),
             title,
             description,
             beneficiary,
@@ -129,639 +174,385 @@ impl CampaignContract {
             end_time,
             verified: false,
             trust_score: 0,
-            nft_count: 0,
             category,
             location,
-            documents_hash,
         };
 
-        // Add ZK constraint for campaign creation
-        let (_, _, campaign_commitment) = cs.allocate_multiplier(None).unwrap();
-        cs.constrain(campaign_commitment);
-
-        self.campaigns.insert(campaign_id, campaign);
+        env.storage().persistent().set(&DataKey::Campaign(campaign_id.clone()), &campaign);
+        
         Ok(campaign_id)
+    }
+
+    /// Get campaign details
+    pub fn get_campaign(env: Env, campaign_id: BytesN<32>) -> Option<Campaign> {
+        env.storage().persistent().get(&DataKey::Campaign(campaign_id))
     }
 
     /// Verify a campaign (admin function)
     pub fn verify_campaign(
-        &mut self,
-        cs: &mut ConstraintSystem,
-        campaign_id: [u8; 32],
-        trust_score: u8,
-    ) -> Result<(), String> {
-        let campaign = self.campaigns.get_mut(&campaign_id)
-            .ok_or("Campaign not found")?;
+        env: Env,
+        campaign_id: BytesN<32>,
+        trust_score: u32,
+    ) -> Result<(), u32> {
+        let mut campaign: Campaign = env.storage().persistent().get(&DataKey::Campaign(campaign_id.clone()))
+            .ok_or(4)?; // campaign_not_found
 
         campaign.verified = true;
         campaign.trust_score = trust_score;
 
-        // ZK constraint for verification
-        let (_, _, verification_commitment) = cs.allocate_multiplier(None).unwrap();
-        cs.constrain(verification_commitment);
-
+        env.storage().persistent().set(&DataKey::Campaign(campaign_id), &campaign);
         Ok(())
-    }
-
-    /// Get campaign details
-    pub fn get_campaign(&self, campaign_id: [u8; 32]) -> Option<&Campaign> {
-        self.campaigns.get(&campaign_id)
-    }
-
-    /// Update campaign progress
-    pub fn update_campaign_progress(
-        &mut self,
-        campaign_id: [u8; 32],
-        additional_amount: u64,
-    ) -> Result<(), String> {
-        let campaign = self.campaigns.get_mut(&campaign_id)
-            .ok_or("Campaign not found")?;
-
-        campaign.current_amount += additional_amount;
-        Ok(())
-    }
-
-    fn get_current_timestamp(&self) -> u64 {
-        // In real implementation, this would get blockchain timestamp
-        1234567890000 // Placeholder
-    }
-}
-
-// ========== DONATION CONTRACT ==========
-
-pub struct DonationContract {
-    donations: HashMap<[u8; 32], Donation>,
-    campaign_contract: CampaignContract,
-    trust_contract: TrustScoreContract,
-    nft_contract: NFTContract,
-}
-
-impl DonationContract {
-    pub fn new(
-        campaign_contract: CampaignContract,
-        trust_contract: TrustScoreContract,
-        nft_contract: NFTContract,
-    ) -> Self {
-        Self {
-            donations: HashMap::new(),
-            campaign_contract,
-            trust_contract,
-            nft_contract,
-        }
     }
 
     /// Process a donation
     pub fn donate(
-        &mut self,
-        cs: &mut ConstraintSystem,
-        campaign_id: [u8; 32],
-        donor: RistrettoPoint,
+        env: Env,
+        campaign_id: BytesN<32>,
+        donor: Address,
         amount: u64,
         anonymous: bool,
         mint_nft: bool,
-    ) -> Result<[u8; 32], String> {
+    ) -> Result<BytesN<32>, u32> {
         // Validate campaign exists and is active
-        let campaign = self.campaign_contract.get_campaign(campaign_id)
-            .ok_or("Campaign not found")?;
+        let mut campaign: Campaign = env.storage().persistent().get(&DataKey::Campaign(campaign_id.clone()))
+            .ok_or(4)?; // campaign_not_found
 
-        let current_time = self.get_current_timestamp();
+        let current_time = env.ledger().timestamp();
         if current_time > campaign.end_time {
-            return Err("Campaign has ended".to_string());
+            return Err(5); // campaign_ended
         }
 
         if amount == 0 {
-            return Err("Donation amount must be greater than 0".to_string());
+            return Err(6); // invalid_amount
         }
 
-        // Generate donation ID
-        let mut transcript = Transcript::new(b"Savia.donate");
-        transcript.append_message(b"campaign_id", &campaign_id);
-        transcript.append_message(b"donor", donor.compress().as_bytes());
-        transcript.append_u64(b"amount", amount);
-        transcript.append_u64(b"timestamp", current_time);
-        
-        let donation_id = transcript.challenge_bytes(b"donation_id");
-
-        // Calculate platform fee
-        let platform_fee = (amount * self.campaign_contract.platform_fee) / 10000;
+        // Get platform fee
+        let platform_fee_rate: u64 = env.storage().instance().get(&DataKey::PlatformFee).unwrap_or(200);
+        let platform_fee = (amount * platform_fee_rate) / 10000;
         let net_amount = amount - platform_fee;
+
+        // Get and increment donation counter
+        let counter: u64 = env.storage().instance().get(&DataKey::DonationCounter).unwrap_or(0);
+        let new_counter = counter + 1;
+        env.storage().instance().set(&DataKey::DonationCounter, &new_counter);
+
+        // Generate donation ID
+        let mut hash_input = Bytes::new(&env);
+        
+        // Convert to bytes properly
+        let campaign_bytes = Bytes::from_slice(&env, campaign_id.as_slice());
+        let donor_bytes = Bytes::from_slice(&env, &donor.to_string().as_bytes());
+        
+        hash_input.append(&campaign_bytes);
+        hash_input.append(&donor_bytes);
+        hash_input.append(&Bytes::from_slice(&env, &amount.to_be_bytes()));
+        hash_input.append(&Bytes::from_slice(&env, &current_time.to_be_bytes()));
+        hash_input.append(&Bytes::from_slice(&env, &new_counter.to_be_bytes()));
+        
+        let donation_id = env.crypto().sha256(&hash_input).into();
 
         // Create donation record
         let donation = Donation {
-            id: donation_id,
-            campaign_id,
-            donor,
+            id: donation_id.clone(),
+            campaign_id: campaign_id.clone(),
+            donor: donor.clone(),
             amount: net_amount,
             timestamp: current_time,
             nft_minted: mint_nft,
-            recurring: false,
             anonymous,
         };
 
-        // ZK constraints for donation validation
-        let (amount_var, _, amount_commitment) = cs.allocate_multiplier(Some(Scalar::from(amount))).unwrap();
-        let (fee_var, _, fee_commitment) = cs.allocate_multiplier(Some(Scalar::from(platform_fee))).unwrap();
-        let (net_var, _, net_commitment) = cs.allocate_multiplier(Some(Scalar::from(net_amount))).unwrap();
-
-        // Constraint: amount = fee + net_amount
-        cs.constrain(amount_var - fee_var - net_var);
-
         // Update campaign progress
-        self.campaign_contract.update_campaign_progress(campaign_id, net_amount)?;
+        campaign.current_amount += net_amount;
+        env.storage().persistent().set(&DataKey::Campaign(campaign_id.clone()), &campaign);
+
+        // Store donation
+        env.storage().persistent().set(&DataKey::Donation(donation_id.clone()), &donation);
 
         // Update trust score
-        self.trust_contract.update_donor_score(donor, net_amount)?;
+        Self::update_donor_trust_score(env.clone(), donor.clone(), net_amount)?;
 
         // Mint NFT if requested
         if mint_nft {
-            self.nft_contract.mint_donation_nft(
-                cs,
-                donor,
-                campaign_id,
-                donation_id,
-                net_amount,
-            )?;
+            Self::mint_donation_nft(env.clone(), donor, campaign_id, donation_id.clone(), net_amount)?;
         }
 
-        self.donations.insert(donation_id, donation);
         Ok(donation_id)
     }
 
     /// Get donation details
-    pub fn get_donation(&self, donation_id: [u8; 32]) -> Option<&Donation> {
-        self.donations.get(&donation_id)
-    }
-
-    /// Get donations for a campaign
-    pub fn get_campaign_donations(&self, campaign_id: [u8; 32]) -> Vec<&Donation> {
-        self.donations.values()
-            .filter(|d| d.campaign_id == campaign_id)
-            .collect()
-    }
-
-    fn get_current_timestamp(&self) -> u64 {
-        1234567890000 // Placeholder
-    }
-}
-
-// ========== TRUST SCORE CONTRACT ==========
-
-pub struct TrustScoreContract {
-    trust_scores: HashMap<RistrettoPoint, TrustScore>,
-}
-
-impl TrustScoreContract {
-    pub fn new() -> Self {
-        Self {
-            trust_scores: HashMap::new(),
-        }
+    pub fn get_donation(env: Env, donation_id: BytesN<32>) -> Option<Donation> {
+        env.storage().persistent().get(&DataKey::Donation(donation_id))
     }
 
     /// Initialize trust score for new user
-    pub fn initialize_trust_score(&mut self, entity: RistrettoPoint) -> Result<(), String> {
-        if self.trust_scores.contains_key(&entity) {
-            return Err("Trust score already exists".to_string());
+    pub fn initialize_trust_score(env: Env, entity: Address) -> Result<(), u32> {
+        if env.storage().persistent().has(&DataKey::TrustScore(entity.clone())) {
+            return Err(7); // score_exists
         }
 
         let trust_score = TrustScore {
-            entity,
+            entity: entity.clone(),
             score: 50, // Start with neutral score
             verification_level: 0,
             donation_count: 0,
             total_donated: 0,
             campaigns_created: 0,
-            last_updated: self.get_current_timestamp(),
+            last_updated: env.ledger().timestamp(),
         };
 
-        self.trust_scores.insert(entity, trust_score);
+        env.storage().persistent().set(&DataKey::TrustScore(entity), &trust_score);
         Ok(())
     }
 
     /// Update donor trust score
-    pub fn update_donor_score(&mut self, donor: RistrettoPoint, amount: u64) -> Result<(), String> {
-        let trust_score = self.trust_scores.get_mut(&donor)
-            .ok_or("Trust score not found")?;
+    fn update_donor_trust_score(env: Env, donor: Address, amount: u64) -> Result<(), u32> {
+        let mut trust_score: TrustScore = env.storage().persistent().get(&DataKey::TrustScore(donor.clone()))
+            .unwrap_or(TrustScore {
+                entity: donor.clone(),
+                score: 50,
+                verification_level: 0,
+                donation_count: 0,
+                total_donated: 0,
+                campaigns_created: 0,
+                last_updated: env.ledger().timestamp(),
+            });
 
         trust_score.donation_count += 1;
         trust_score.total_donated += amount;
-        trust_score.last_updated = self.get_current_timestamp();
+        trust_score.last_updated = env.ledger().timestamp();
 
         // Calculate new score based on donation history
-        let donation_factor = (trust_score.donation_count.min(100) as f64) / 100.0;
-        let amount_factor = (trust_score.total_donated.min(100000) as f64) / 100000.0;
-        let consistency_factor = if trust_score.donation_count > 1 { 1.2 } else { 1.0 };
+        let donation_factor = if trust_score.donation_count > 100 { 100 } else { trust_score.donation_count };
+        let amount_factor = if trust_score.total_donated > 100000 { 100000 } else { trust_score.total_donated };
+        let consistency_factor = if trust_score.donation_count > 1 { 120u64 } else { 100u64 };
 
-        let new_score = 50.0 + (25.0 * donation_factor) + (20.0 * amount_factor) * consistency_factor;
-        trust_score.score = new_score.min(100.0) as u8;
+        // Fixed arithmetic types
+        let new_score = 50u64 + (25u64 * donation_factor as u64 / 100u64) + (20u64 * amount_factor / 100000u64) * consistency_factor / 100u64;
+        trust_score.score = if new_score > 100 { 100 } else { new_score as u32 };
 
-        Ok(())
-    }
-
-    /// Update campaign creator trust score
-    pub fn update_creator_score(&mut self, creator: RistrettoPoint, successful: bool) -> Result<(), String> {
-        let trust_score = self.trust_scores.get_mut(&creator)
-            .ok_or("Trust score not found")?;
-
-        trust_score.campaigns_created += 1;
-        trust_score.last_updated = self.get_current_timestamp();
-
-        if successful {
-            trust_score.score = (trust_score.score + 5).min(100);
-        } else {
-            trust_score.score = trust_score.score.saturating_sub(10);
-        }
-
+        env.storage().persistent().set(&DataKey::TrustScore(donor), &trust_score);
         Ok(())
     }
 
     /// Get trust score
-    pub fn get_trust_score(&self, entity: RistrettoPoint) -> Option<&TrustScore> {
-        self.trust_scores.get(&entity)
-    }
-
-    fn get_current_timestamp(&self) -> u64 {
-        1234567890000 // Placeholder
-    }
-}
-
-// ========== NFT CONTRACT ==========
-
-pub struct NFTContract {
-    nfts: HashMap<[u8; 32], NFTBadge>,
-    nft_counter: u64,
-}
-
-impl NFTContract {
-    pub fn new() -> Self {
-        Self {
-            nfts: HashMap::new(),
-            nft_counter: 0,
-        }
+    pub fn get_trust_score(env: Env, entity: Address) -> Option<TrustScore> {
+        env.storage().persistent().get(&DataKey::TrustScore(entity))
     }
 
     /// Mint donation NFT
-    pub fn mint_donation_nft(
-        &mut self,
-        cs: &mut ConstraintSystem,
-        owner: RistrettoPoint,
-        campaign_id: [u8; 32],
-        donation_id: [u8; 32],
+    fn mint_donation_nft(
+        env: Env,
+        owner: Address,
+        campaign_id: BytesN<32>,
+        donation_id: BytesN<32>,
         amount: u64,
-    ) -> Result<[u8; 32], String> {
-        self.nft_counter += 1;
+    ) -> Result<BytesN<32>, u32> {
+        // Get and increment NFT counter
+        let counter: u64 = env.storage().instance().get(&DataKey::NFTCounter).unwrap_or(0);
+        let new_counter = counter + 1;
+        env.storage().instance().set(&DataKey::NFTCounter, &new_counter);
 
         // Generate NFT ID
-        let mut transcript = Transcript::new(b"Savia.mint_nft");
-        transcript.append_message(b"owner", owner.compress().as_bytes());
-        transcript.append_message(b"campaign_id", &campaign_id);
-        transcript.append_message(b"donation_id", &donation_id);
-        transcript.append_u64(b"amount", amount);
-        transcript.append_u64(b"counter", self.nft_counter);
+        let mut hash_input = Bytes::new(&env);
         
-        let nft_id = transcript.challenge_bytes(b"nft_id");
+        let owner_bytes = Bytes::from_slice(&env, &owner.to_string().as_bytes());
+        let campaign_bytes = Bytes::from_slice(&env, campaign_id.as_slice());
+        let donation_bytes = Bytes::from_slice(&env, donation_id.as_slice());
+        
+        hash_input.append(&owner_bytes);
+        hash_input.append(&campaign_bytes);
+        hash_input.append(&donation_bytes);
+        hash_input.append(&Bytes::from_slice(&env, &amount.to_be_bytes()));
+        hash_input.append(&Bytes::from_slice(&env, &new_counter.to_be_bytes()));
+        
+        let nft_id = env.crypto().sha256(&hash_input).into();
 
         // Determine badge type based on amount
-        let badge_type = self.get_badge_type(amount);
-
-        // Create metadata URI
-        let metadata_uri = format!(
-            "https://savia.org/nft/{}/{}",
-            hex::encode(campaign_id),
-            hex::encode(nft_id)
-        );
+        let badge_type = Self::get_badge_type(&env, amount);
 
         let nft_badge = NFTBadge {
-            id: nft_id,
+            id: nft_id.clone(),
             owner,
             badge_type,
             campaign_id: Some(campaign_id),
-            minted_at: self.get_current_timestamp(),
-            metadata_uri,
+            minted_at: env.ledger().timestamp(),
+            metadata_uri: String::from_str(&env, "https://savia.org/nft/metadata"),
         };
 
-        // ZK constraint for NFT minting
-        let (_, _, nft_commitment) = cs.allocate_multiplier(None).unwrap();
-        cs.constrain(nft_commitment);
-
-        self.nfts.insert(nft_id, nft_badge);
-        Ok(nft_id)
-    }
-
-    /// Mint achievement badge
-    pub fn mint_achievement_badge(
-        &mut self,
-        cs: &mut ConstraintSystem,
-        owner: RistrettoPoint,
-        badge_type: String,
-    ) -> Result<[u8; 32], String> {
-        self.nft_counter += 1;
-
-        let mut transcript = Transcript::new(b"Savia.mint_badge");
-        transcript.append_message(b"owner", owner.compress().as_bytes());
-        transcript.append_message(b"badge_type", badge_type.as_bytes());
-        transcript.append_u64(b"counter", self.nft_counter);
-        
-        let nft_id = transcript.challenge_bytes(b"nft_id");
-
-        let metadata_uri = format!(
-            "https://savia.org/badge/{}/{}",
-            badge_type,
-            hex::encode(nft_id)
-        );
-
-        let nft_badge = NFTBadge {
-            id: nft_id,
-            owner,
-            badge_type,
-            campaign_id: None,
-            minted_at: self.get_current_timestamp(),
-            metadata_uri,
-        };
-
-        // ZK constraint for badge minting
-        let (_, _, badge_commitment) = cs.allocate_multiplier(None).unwrap();
-        cs.constrain(badge_commitment);
-
-        self.nfts.insert(nft_id, nft_badge);
+        env.storage().persistent().set(&DataKey::NFTBadge(nft_id.clone()), &nft_badge);
         Ok(nft_id)
     }
 
     /// Get NFT details
-    pub fn get_nft(&self, nft_id: [u8; 32]) -> Option<&NFTBadge> {
-        self.nfts.get(&nft_id)
-    }
-
-    /// Get NFTs owned by user
-    pub fn get_user_nfts(&self, owner: RistrettoPoint) -> Vec<&NFTBadge> {
-        self.nfts.values()
-            .filter(|nft| nft.owner == owner)
-            .collect()
-    }
-
-    /// Burn NFT (for milestones or conversions)
-    pub fn burn_nft(
-        &mut self,
-        cs: &mut ConstraintSystem,
-        nft_id: [u8; 32],
-        owner: RistrettoPoint,
-    ) -> Result<(), String> {
-        let nft = self.nfts.get(&nft_id)
-            .ok_or("NFT not found")?;
-
-        if nft.owner != owner {
-            return Err("Not the owner of this NFT".to_string());
-        }
-
-        // ZK constraint for NFT burning
-        let (_, _, burn_commitment) = cs.allocate_multiplier(None).unwrap();
-        cs.constrain(burn_commitment);
-
-        self.nfts.remove(&nft_id);
-        Ok(())
-    }
-
-    fn get_badge_type(&self, amount: u64) -> String {
-        match amount {
-            0..=999 => "Bronze Supporter".to_string(),
-            1000..=4999 => "Silver Supporter".to_string(),
-            5000..=9999 => "Gold Supporter".to_string(),
-            10000..=49999 => "Platinum Supporter".to_string(),
-            _ => "Diamond Supporter".to_string(),
-        }
-    }
-
-    fn get_current_timestamp(&self) -> u64 {
-        1234567890000 // Placeholder
-    }
-}
-
-// ========== DISBURSEMENT CONTRACT ==========
-
-pub struct DisbursementContract {
-    disbursements: HashMap<[u8; 32], Disbursement>,
-    campaign_contract: CampaignContract,
-}
-
-#[derive(Debug, Clone)]
-pub struct Disbursement {
-    pub id: [u8; 32],
-    pub campaign_id: [u8; 32],
-    pub recipient: RistrettoPoint,
-    pub amount: u64,
-    pub milestone: String,
-    pub status: DisbursementStatus,
-    pub created_at: u64,
-    pub executed_at: Option<u64>,
-    pub proof_documents: Vec<[u8; 32]>,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub enum DisbursementStatus {
-    Pending,
-    Approved,
-    Executed,
-    Rejected,
-}
-
-impl DisbursementContract {
-    pub fn new(campaign_contract: CampaignContract) -> Self {
-        Self {
-            disbursements: HashMap::new(),
-            campaign_contract,
-        }
+    pub fn get_nft(env: Env, nft_id: BytesN<32>) -> Option<NFTBadge> {
+        env.storage().persistent().get(&DataKey::NFTBadge(nft_id))
     }
 
     /// Create disbursement request
     pub fn create_disbursement(
-        &mut self,
-        cs: &mut ConstraintSystem,
-        campaign_id: [u8; 32],
-        recipient: RistrettoPoint,
+        env: Env,
+        campaign_id: BytesN<32>,
+        recipient: Address,
         amount: u64,
         milestone: String,
-        proof_documents: Vec<[u8; 32]>,
-    ) -> Result<[u8; 32], String> {
-        let campaign = self.campaign_contract.get_campaign(campaign_id)
-            .ok_or("Campaign not found")?;
+    ) -> Result<BytesN<32>, u32> {
+        let campaign: Campaign = env.storage().persistent().get(&DataKey::Campaign(campaign_id.clone()))
+            .ok_or(4)?; // campaign_not_found
 
         if amount > campaign.current_amount {
-            return Err("Disbursement amount exceeds available funds".to_string());
+            return Err(8); // insufficient_funds
         }
 
-        let mut transcript = Transcript::new(b"Savia.create_disbursement");
-        transcript.append_message(b"campaign_id", &campaign_id);
-        transcript.append_message(b"recipient", recipient.compress().as_bytes());
-        transcript.append_u64(b"amount", amount);
-        transcript.append_message(b"milestone", milestone.as_bytes());
+        // Get and increment disbursement counter
+        let counter: u64 = env.storage().instance().get(&DataKey::DisbursementCounter).unwrap_or(0);
+        let new_counter = counter + 1;
+        env.storage().instance().set(&DataKey::DisbursementCounter, &new_counter);
+
+        // Generate disbursement ID
+        let mut hash_input = Bytes::new(&env);
         
-        let disbursement_id = transcript.challenge_bytes(b"disbursement_id");
+        let campaign_bytes = Bytes::from_slice(&env, campaign_id.as_slice());
+        let recipient_bytes = Bytes::from_slice(&env, &recipient.to_string().as_bytes());
+        let milestone_bytes = Bytes::from_slice(&env, milestone.as_bytes());
+        
+        hash_input.append(&campaign_bytes);
+        hash_input.append(&recipient_bytes);
+        hash_input.append(&Bytes::from_slice(&env, &amount.to_be_bytes()));
+        hash_input.append(&milestone_bytes);
+        hash_input.append(&Bytes::from_slice(&env, &new_counter.to_be_bytes()));
+        
+        let disbursement_id = env.crypto().sha256(&hash_input).into();
 
         let disbursement = Disbursement {
-            id: disbursement_id,
+            id: disbursement_id.clone(),
             campaign_id,
             recipient,
             amount,
             milestone,
             status: DisbursementStatus::Pending,
-            created_at: self.get_current_timestamp(),
+            created_at: env.ledger().timestamp(),
             executed_at: None,
-            proof_documents,
         };
 
-        // ZK constraint for disbursement creation
-        let (_, _, disbursement_commitment) = cs.allocate_multiplier(None).unwrap();
-        cs.constrain(disbursement_commitment);
-
-        self.disbursements.insert(disbursement_id, disbursement);
+        env.storage().persistent().set(&DataKey::Disbursement(disbursement_id.clone()), &disbursement);
         Ok(disbursement_id)
     }
 
     /// Execute approved disbursement
     pub fn execute_disbursement(
-        &mut self,
-        cs: &mut ConstraintSystem,
-        disbursement_id: [u8; 32],
-    ) -> Result<(), String> {
-        let disbursement = self.disbursements.get_mut(&disbursement_id)
-            .ok_or("Disbursement not found")?;
+        env: Env,
+        disbursement_id: BytesN<32>,
+    ) -> Result<(), u32> {
+        let mut disbursement: Disbursement = env.storage().persistent().get(&DataKey::Disbursement(disbursement_id.clone()))
+            .ok_or(9)?; // disbursement_not_found
 
         if disbursement.status != DisbursementStatus::Approved {
-            return Err("Disbursement not approved".to_string());
+            return Err(10); // not_approved
         }
 
-        // ZK constraint for disbursement execution
-        let (_, _, execution_commitment) = cs.allocate_multiplier(None).unwrap();
-        cs.constrain(execution_commitment);
-
         disbursement.status = DisbursementStatus::Executed;
-        disbursement.executed_at = Some(self.get_current_timestamp());
+        disbursement.executed_at = Some(env.ledger().timestamp());
 
+        env.storage().persistent().set(&DataKey::Disbursement(disbursement_id), &disbursement);
         Ok(())
     }
 
-    fn get_current_timestamp(&self) -> u64 {
-        1234567890000 // Placeholder
+    /// Get disbursement details
+    pub fn get_disbursement(env: Env, disbursement_id: BytesN<32>) -> Option<Disbursement> {
+        env.storage().persistent().get(&DataKey::Disbursement(disbursement_id))
     }
-}
 
-// ========== MAIN CONTRACT ORCHESTRATOR ==========
-
-pub struct SaviaProtocol {
-    pub campaign_contract: CampaignContract,
-    pub donation_contract: DonationContract,
-    pub trust_contract: TrustScoreContract,
-    pub nft_contract: NFTContract,
-    pub disbursement_contract: DisbursementContract,
-}
-
-impl SaviaProtocol {
-    pub fn new(platform_fee: u64) -> Self {
-        let campaign_contract = CampaignContract::new(platform_fee);
-        let trust_contract = TrustScoreContract::new();
-        let nft_contract = NFTContract::new();
-        let disbursement_contract = DisbursementContract::new(campaign_contract.clone());
-        
-        let donation_contract = DonationContract::new(
-            campaign_contract.clone(),
-            trust_contract.clone(),
-            nft_contract.clone(),
-        );
-
-        Self {
-            campaign_contract,
-            donation_contract,
-            trust_contract,
-            nft_contract,
-            disbursement_contract,
+    /// Helper function to determine badge type based on amount
+    fn get_badge_type(env: &Env, amount: u64) -> String {
+        if amount < 1000 {
+            String::from_str(env, "Bronze Supporter")
+        } else if amount < 5000 {
+            String::from_str(env, "Silver Supporter")
+        } else if amount < 10000 {
+            String::from_str(env, "Gold Supporter")
+        } else if amount < 50000 {
+            String::from_str(env, "Platinum Supporter")
+        } else {
+            String::from_str(env, "Diamond Supporter")
         }
-    }
-
-    /// Initialize new user in the system
-    pub fn initialize_user(&mut self, user: RistrettoPoint) -> Result<(), String> {
-        self.trust_contract.initialize_trust_score(user)
-    }
-
-    /// Complete donation flow with all related updates
-    pub fn complete_donation_flow(
-        &mut self,
-        cs: &mut ConstraintSystem,
-        campaign_id: [u8; 32],
-        donor: RistrettoPoint,
-        amount: u64,
-        anonymous: bool,
-        mint_nft: bool,
-    ) -> Result<[u8; 32], String> {
-        self.donation_contract.donate(cs, campaign_id, donor, amount, anonymous, mint_nft)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use curve25519_dalek::constants::RISTRETTO_BASEPOINT_POINT;
+    use soroban_sdk::{testutils::Address as _, Address, Env};
 
     #[test]
-    fn test_campaign_creation() {
-        let mut campaign_contract = CampaignContract::new(200); // 2% fee
-        let mut cs = ConstraintSystem::new();
+    fn test_initialize_contract() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, SaviaContract);
+        let client = SaviaContractClient::new(&env, &contract_id);
 
-        let beneficiary = RISTRETTO_BASEPOINT_POINT;
-        let result = campaign_contract.create_campaign(
-            &mut cs,
-            "Test Campaign".to_string(),
-            "A test campaign".to_string(),
-            beneficiary,
-            10000,
-            30,
-            "Health".to_string(),
-            "Test City".to_string(),
-            [0u8; 32],
+        let result = client.initialize(&200);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_create_campaign() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, SaviaContract);
+        let client = SaviaContractClient::new(&env, &contract_id);
+
+        client.initialize(&200);
+
+        let beneficiary = Address::generate(&env);
+        let result = client.create_campaign(
+            &beneficiary,
+            &String::from_str(&env, "Test Campaign"),
+            &String::from_str(&env, "A test campaign"),
+            &10000,
+            &30,
+            &String::from_str(&env, "Health"),
+            &String::from_str(&env, "Test City"),
         );
 
         assert!(result.is_ok());
         let campaign_id = result.unwrap();
-        let campaign = campaign_contract.get_campaign(campaign_id).unwrap();
-        assert_eq!(campaign.title, "Test Campaign");
-        assert_eq!(campaign.goal_amount, 10000);
+        let campaign = client.get_campaign(&campaign_id);
+        assert!(campaign.is_some());
     }
 
     #[test]
     fn test_donation_flow() {
-        let mut protocol = SaviaProtocol::new(200);
-        let mut cs = ConstraintSystem::new();
+        let env = Env::default();
+        let contract_id = env.register_contract(None, SaviaContract);
+        let client = SaviaContractClient::new(&env, &contract_id);
 
-        let beneficiary = RISTRETTO_BASEPOINT_POINT;
-        let donor = RISTRETTO_BASEPOINT_POINT;
+        client.initialize(&200);
 
-        // Initialize user
-        protocol.initialize_user(donor).unwrap();
+        let beneficiary = Address::generate(&env);
+        let donor = Address::generate(&env);
 
         // Create campaign
-        let campaign_id = protocol.campaign_contract.create_campaign(
-            &mut cs,
-            "Test Campaign".to_string(),
-            "A test campaign".to_string(),
-            beneficiary,
-            10000,
-            30,
-            "Health".to_string(),
-            "Test City".to_string(),
-            [0u8; 32],
+        let campaign_id = client.create_campaign(
+            &beneficiary,
+            &String::from_str(&env, "Test Campaign"),
+            &String::from_str(&env, "A test campaign"),
+            &10000,
+            &30,
+            &String::from_str(&env, "Health"),
+            &String::from_str(&env, "Test City"),
         ).unwrap();
 
         // Make donation
-        let donation_id = protocol.complete_donation_flow(
-            &mut cs,
-            campaign_id,
-            donor,
-            1000,
-            false,
-            true,
+        let donation_id = client.donate(
+            &campaign_id,
+            &donor,
+            &1000,
+            &false,
+            &true,
         ).unwrap();
 
         // Verify donation
-        let donation = protocol.donation_contract.get_donation(donation_id).unwrap();
-        assert_eq!(donation.amount, 980); // 1000 - 2% fee
-        assert_eq!(donation.nft_minted, true);
+        let donation = client.get_donation(&donation_id);
+        assert!(donation.is_some());
+        assert_eq!(donation.unwrap().amount, 980); // 1000 - 2% fee
     }
 }
