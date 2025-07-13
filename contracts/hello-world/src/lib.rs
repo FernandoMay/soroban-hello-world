@@ -1,5 +1,8 @@
 #![no_std]
-use soroban_sdk::{contract, contractimpl, contracttype, Address, Bytes, BytesN, Env, FromVal, String, vec};
+use soroban_sdk::{contract, contractimpl, contracttype, xdr::ToXdr, Address, Bytes, BytesN, Env, String};
+
+extern crate alloc;
+use alloc::string::ToString;
 
 // Savia Smart Contracts for Stellar
 // Fixed version compatible with Soroban SDK
@@ -114,26 +117,18 @@ pub enum SaviaError {
     NotApproved = 10,
 }
 
-// Implement From trait for SaviaError to work with Soroban SDK
-impl From<SaviaError> for soroban_sdk::Error {
-    fn from(e: SaviaError) -> Self {
-        soroban_sdk::Error::from_contract_error(e as u32)
-    }
-}
-
 // ========== MAIN CONTRACT ==========
 
 #[contract]
 pub struct SaviaContract;
 
 #[contractimpl]
-
 impl SaviaContract {
     
     /// Initialize the contract with platform fee
-    pub fn initialize(env: Env, platform_fee: u64) -> Result<(), SaviaError> {
+    pub fn initialize(env: Env, platform_fee: u64) -> Result<(), soroban_sdk::Error> {
         if platform_fee > 1000 {
-            return Err(SaviaError::InvalidFee);
+            return Err(soroban_sdk::Error::from_contract_error(SaviaError::InvalidFee as u32));
         }
         
         env.storage().instance().set(&DataKey::PlatformFee, &platform_fee);
@@ -155,14 +150,14 @@ impl SaviaContract {
         duration_days: u64,
         category: String,
         location: String,
-    ) -> Result<BytesN<32>, SaviaError> {
+    ) -> Result<BytesN<32>, soroban_sdk::Error> {
         // Validate inputs
         if goal_amount == 0 {
-            return Err(SaviaError::InvalidGoal);
+            return Err(soroban_sdk::Error::from_contract_error(SaviaError::InvalidGoal as u32));
         }
         
         if duration_days == 0 || duration_days > 365 {
-            return Err(SaviaError::InvalidDuration);
+            return Err(soroban_sdk::Error::from_contract_error(SaviaError::InvalidDuration as u32));
         }
 
         // Get and increment campaign counter
@@ -174,28 +169,22 @@ impl SaviaContract {
         let current_time = env.ledger().timestamp();
         let mut hash_input = Bytes::new(&env);
         
-        // Convert Address to bytes properly
-        // For Address - convert to bytes using its ID
-        let binding = beneficiary.to_string();
-        let beneficiary_bytes = binding.as_val().as_ref();
-        // let beneficiary_bytes = beneficiary.to_string().as_val().as_ref();
-        // Para String de Soroban - acceder a los bytes directamente
-        let title_bytes = title.as_val().as_ref();
+        // Convert to bytes properly
+        let beneficiary_bytes = beneficiary.clone().to_xdr(&env);
+        let title_bytes = title.to_string().into_bytes();
                
-        // Convert u64 to bytes properly
-        
-        hash_input.append(&Bytes::from_val(&env, beneficiary_bytes));
-        hash_input.append(&Bytes::from_val(&env, title_bytes));
+        hash_input.append(&beneficiary_bytes); //&Bytes::from_slice(&env, &beneficiary_bytes));
+        hash_input.append(&Bytes::from_slice(&env, &title_bytes));
         hash_input.append(&Bytes::from_slice(&env, &goal_amount.to_be_bytes()));
         hash_input.append(&Bytes::from_slice(&env, &current_time.to_be_bytes()));
         hash_input.append(&Bytes::from_slice(&env, &new_counter.to_be_bytes()));
         
-        let campaign_id = env.crypto().sha256(&hash_input).into();
+        let campaign_id: BytesN<32> = env.crypto().sha256(&hash_input).into();
 
         let end_time = current_time + (duration_days * 24 * 60 * 60); // Convert to seconds
 
         let campaign = Campaign {
-            id: campaign_id,
+            id: campaign_id.clone(),
             title,
             description,
             beneficiary,
@@ -224,9 +213,9 @@ impl SaviaContract {
         env: Env,
         campaign_id: BytesN<32>,
         trust_score: u32,
-    ) -> Result<(), SaviaError> {
+    ) -> Result<(), soroban_sdk::Error> {
         let mut campaign: Campaign = env.storage().persistent().get(&DataKey::Campaign(campaign_id.clone()))
-            .ok_or(SaviaError::CampaignNotFound)?;
+            .ok_or(soroban_sdk::Error::from_contract_error(SaviaError::CampaignNotFound as u32))?;
 
         campaign.verified = true;
         campaign.trust_score = trust_score;
@@ -243,18 +232,18 @@ impl SaviaContract {
         amount: u64,
         anonymous: bool,
         mint_nft: bool,
-    ) -> Result<BytesN<32>, SaviaError> {
+    ) -> Result<BytesN<32>, soroban_sdk::Error> {
         // Validate campaign exists and is active
         let mut campaign: Campaign = env.storage().persistent().get(&DataKey::Campaign(campaign_id.clone()))
-            .ok_or(SaviaError::CampaignNotFound)?;
+            .ok_or(soroban_sdk::Error::from_contract_error(SaviaError::CampaignNotFound as u32))?;
 
         let current_time = env.ledger().timestamp();
         if current_time > campaign.end_time {
-            return Err(SaviaError::CampaignEnded);
+            return Err(soroban_sdk::Error::from_contract_error(SaviaError::CampaignEnded as u32));
         }
 
         if amount == 0 {
-            return Err(SaviaError::InvalidAmount);
+            return Err(soroban_sdk::Error::from_contract_error(SaviaError::InvalidAmount as u32));
         }
 
         // Get platform fee
@@ -272,20 +261,20 @@ impl SaviaContract {
         
         // Convert to bytes properly
         let campaign_bytes = Bytes::from_slice(&env, campaign_id.to_array().as_slice());
-        let donor_bytes = donor.to_string().as_val().as_ref();
+        let donor_bytes = donor.clone().to_xdr(&env);
         
         hash_input.append(&campaign_bytes);
-        hash_input.append(&Bytes::from_slice(&env, donor_bytes));
+        hash_input.append(&donor_bytes);
         hash_input.append(&Bytes::from_slice(&env, &amount.to_be_bytes()));
         hash_input.append(&Bytes::from_slice(&env, &current_time.to_be_bytes()));
         hash_input.append(&Bytes::from_slice(&env, &new_counter.to_be_bytes()));
         
-        let donation_id = env.crypto().sha256(&hash_input).into();
+        let donation_id: BytesN<32> = env.crypto().sha256(&hash_input).into();
 
         // Create donation record
         let donation = Donation {
-            id: donation_id,
-            campaign_id,
+            id: donation_id.clone(),
+            campaign_id: campaign_id.clone(),
             donor: donor.clone(),
             amount: net_amount,
             timestamp: current_time,
@@ -295,17 +284,17 @@ impl SaviaContract {
 
         // Update campaign progress
         campaign.current_amount += net_amount;
-        env.storage().persistent().set(&DataKey::Campaign(campaign_id), &campaign);
+        env.storage().persistent().set(&DataKey::Campaign(campaign_id.clone()), &campaign);
 
         // Store donation
-        env.storage().persistent().set(&DataKey::Donation(donation_id), &donation);
+        env.storage().persistent().set(&DataKey::Donation(donation_id.clone()), &donation);
 
         // Update trust score
         Self::update_donor_trust_score(env.clone(), donor.clone(), net_amount)?;
 
         // Mint NFT if requested
         if mint_nft {
-            Self::mint_donation_nft(env.clone(), donor, campaign_id, donation_id, net_amount)?;
+            Self::mint_donation_nft(env.clone(), donor, campaign_id, donation_id.clone(), net_amount)?;
         }
 
         Ok(donation_id)
@@ -317,9 +306,9 @@ impl SaviaContract {
     }
 
     /// Initialize trust score for new user
-    pub fn initialize_trust_score(env: Env, entity: Address) -> Result<(), SaviaError> {
+    pub fn initialize_trust_score(env: Env, entity: Address) -> Result<(), soroban_sdk::Error> {
         if env.storage().persistent().has(&DataKey::TrustScore(entity.clone())) {
-            return Err(SaviaError::ScoreExists);
+            return Err(soroban_sdk::Error::from_contract_error(SaviaError::ScoreExists as u32));
         }
 
         let trust_score = TrustScore {
@@ -337,7 +326,7 @@ impl SaviaContract {
     }
 
     /// Update donor trust score
-    fn update_donor_trust_score(env: Env, donor: Address, amount: u64) -> Result<(), SaviaError> {
+    fn update_donor_trust_score(env: Env, donor: Address, amount: u64) -> Result<(), soroban_sdk::Error> {
         let mut trust_score: TrustScore = env.storage().persistent().get(&DataKey::TrustScore(donor.clone()))
             .unwrap_or(TrustScore {
                 entity: donor.clone(),
@@ -378,7 +367,7 @@ impl SaviaContract {
         campaign_id: BytesN<32>,
         donation_id: BytesN<32>,
         amount: u64,
-    ) -> Result<BytesN<32>, SaviaError> {
+    ) -> Result<BytesN<32>, soroban_sdk::Error> {
         // Get and increment NFT counter
         let counter: u64 = env.storage().instance().get(&DataKey::NFTCounter).unwrap_or(0);
         let new_counter = counter + 1;
@@ -387,7 +376,7 @@ impl SaviaContract {
         // Generate NFT ID
         let mut hash_input = Bytes::new(&env);
         
-        let owner_bytes = Bytes::from_slice(&env, owner.to_string().as_bytes());
+        let owner_bytes = owner.clone().to_xdr(&env);
         let campaign_bytes = Bytes::from_slice(&env, campaign_id.to_array().as_slice());
         let donation_bytes = Bytes::from_slice(&env, donation_id.to_array().as_slice());
         
@@ -397,13 +386,13 @@ impl SaviaContract {
         hash_input.append(&Bytes::from_slice(&env, &amount.to_be_bytes()));
         hash_input.append(&Bytes::from_slice(&env, &new_counter.to_be_bytes()));
         
-        let nft_id = env.crypto().sha256(&hash_input).into();
+        let nft_id: BytesN<32> = env.crypto().sha256(&hash_input).into();
 
         // Determine badge type based on amount
         let badge_type = Self::get_badge_type(&env, amount);
 
         let nft_badge = NFTBadge {
-            id: nft_id,
+            id: nft_id.clone(),
             owner,
             badge_type,
             campaign_id: Some(campaign_id),
@@ -411,7 +400,7 @@ impl SaviaContract {
             metadata_uri: String::from_str(&env, "https://savia.org/nft/metadata"),
         };
 
-        env.storage().persistent().set(&DataKey::NFTBadge(nft_id), &nft_badge);
+        env.storage().persistent().set(&DataKey::NFTBadge(nft_id.clone()), &nft_badge);
         Ok(nft_id)
     }
 
@@ -427,12 +416,12 @@ impl SaviaContract {
         recipient: Address,
         amount: u64,
         milestone: String,
-    ) -> Result<BytesN<32>, SaviaError> {
-        let campaign: Campaign = env.storage().persistent().get(&DataKey::Campaign(campaign_id))
-            .ok_or(SaviaError::CampaignNotFound)?;
+    ) -> Result<BytesN<32>, soroban_sdk::Error> {
+        let campaign: Campaign = env.storage().persistent().get(&DataKey::Campaign(campaign_id.clone()))
+            .ok_or(soroban_sdk::Error::from_contract_error(SaviaError::CampaignNotFound as u32))?;
 
         if amount > campaign.current_amount {
-            return Err(SaviaError::InsufficientFunds);
+            return Err(soroban_sdk::Error::from_contract_error(SaviaError::InsufficientFunds as u32));
         }
 
         // Get and increment disbursement counter
@@ -444,19 +433,19 @@ impl SaviaContract {
         let mut hash_input = Bytes::new(&env);
         
         let campaign_bytes = Bytes::from_slice(&env, campaign_id.to_array().as_slice());
-        let recipient_bytes = Bytes::from_slice(&env, recipient.to_string().as_bytes());
-        let milestone_bytes = Bytes::from_slice(&env, milestone.as_bytes());
+        let recipient_bytes = recipient.clone().to_xdr(&env);
+        let milestone_bytes = milestone.to_string().into_bytes();
         
         hash_input.append(&campaign_bytes);
         hash_input.append(&recipient_bytes);
         hash_input.append(&Bytes::from_slice(&env, &amount.to_be_bytes()));
-        hash_input.append(&milestone_bytes);
+        hash_input.append(&Bytes::from_slice(&env, &milestone_bytes));
         hash_input.append(&Bytes::from_slice(&env, &new_counter.to_be_bytes()));
         
-        let disbursement_id = env.crypto().sha256(&hash_input).into();
+        let disbursement_id: BytesN<32> = env.crypto().sha256(&hash_input).into();
 
         let disbursement = Disbursement {
-            id: disbursement_id,
+            id: disbursement_id.clone(),
             campaign_id,
             recipient,
             amount,
@@ -466,7 +455,7 @@ impl SaviaContract {
             executed_at: None,
         };
 
-        env.storage().persistent().set(&DataKey::Disbursement(disbursement_id), &disbursement);
+        env.storage().persistent().set(&DataKey::Disbursement(disbursement_id.clone()), &disbursement);
         Ok(disbursement_id)
     }
 
@@ -474,12 +463,12 @@ impl SaviaContract {
     pub fn execute_disbursement(
         env: Env,
         disbursement_id: BytesN<32>,
-    ) -> Result<(), SaviaError> {
+    ) -> Result<(), soroban_sdk::Error> {
         let mut disbursement: Disbursement = env.storage().persistent().get(&DataKey::Disbursement(disbursement_id.clone()))
-            .ok_or(SaviaError::DisbursementNotFound)?;
+            .ok_or(soroban_sdk::Error::from_contract_error(SaviaError::DisbursementNotFound as u32))?;
 
         if disbursement.status != DisbursementStatus::Approved {
-            return Err(SaviaError::NotApproved);
+            return Err(soroban_sdk::Error::from_contract_error(SaviaError::NotApproved as u32));
         }
 
         disbursement.status = DisbursementStatus::Executed;
