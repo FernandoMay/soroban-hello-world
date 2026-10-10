@@ -2,7 +2,6 @@
 use soroban_sdk::{contract, contractimpl, contracttype, xdr::ToXdr, Address, Bytes, BytesN, Env, String};
 
 extern crate alloc;
-use alloc::string::ToString;
 
 // Savia Smart Contracts for Stellar
 // Fixed version compatible with Soroban SDK
@@ -56,7 +55,7 @@ pub struct NFTBadge {
     pub id: BytesN<32>,
     pub owner: Address,
     pub badge_type: String,
-    pub campaign_id: Option<BytesN<32>>,
+    pub campaign_id: BytesN<32>, // donation NFTs always carry their campaign
     pub minted_at: u64,
     pub metadata_uri: String,
 }
@@ -101,6 +100,15 @@ pub enum DataKey {
 }
 
 // ========== ERROR CODES ==========
+
+/// Convert a soroban String into host bytes for hashing.
+/// soroban_sdk::String has no to_string() in no_std; the supported path
+/// is len() + copy_into_slice().
+fn string_to_bytes(s: &soroban_sdk::String) -> alloc::vec::Vec<u8> {
+    let mut buf = alloc::vec![0u8; s.len() as usize];
+    s.copy_into_slice(&mut buf);
+    buf
+}
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 #[contracttype]
@@ -171,7 +179,7 @@ impl SaviaContract {
         
         // Convert to bytes properly
         let beneficiary_bytes = beneficiary.clone().to_xdr(&env);
-        let title_bytes = title.to_string().into_bytes();
+        let title_bytes = string_to_bytes(&title);
                
         hash_input.append(&beneficiary_bytes); //&Bytes::from_slice(&env, &beneficiary_bytes));
         hash_input.append(&Bytes::from_slice(&env, &title_bytes));
@@ -224,7 +232,7 @@ impl SaviaContract {
         Ok(())
     }
 
-    /// Process a donation
+    /// Process a donation. Returns (donation_id, minted_nft_id_if_any).
     pub fn donate(
         env: Env,
         campaign_id: BytesN<32>,
@@ -232,7 +240,7 @@ impl SaviaContract {
         amount: u64,
         anonymous: bool,
         mint_nft: bool,
-    ) -> Result<BytesN<32>, soroban_sdk::Error> {
+    ) -> Result<(BytesN<32>, Option<BytesN<32>>), soroban_sdk::Error> {
         // Validate campaign exists and is active
         let mut campaign: Campaign = env.storage().persistent().get(&DataKey::Campaign(campaign_id.clone()))
             .ok_or(soroban_sdk::Error::from_contract_error(SaviaError::CampaignNotFound as u32))?;
@@ -292,12 +300,21 @@ impl SaviaContract {
         // Update trust score
         Self::update_donor_trust_score(env.clone(), donor.clone(), net_amount)?;
 
-        // Mint NFT if requested
+        // Mint NFT if requested (the badge ID is now returned to the caller
+        // instead of being unrecoverable).
+        let mut minted_nft: Option<BytesN<32>> = None;
         if mint_nft {
-            Self::mint_donation_nft(env.clone(), donor, campaign_id, donation_id.clone(), net_amount)?;
+            let nft_id = Self::mint_donation_nft(
+                env.clone(),
+                donor,
+                campaign_id,
+                donation_id.clone(),
+                net_amount,
+            )?;
+            minted_nft = Some(nft_id);
         }
 
-        Ok(donation_id)
+        Ok((donation_id, minted_nft))
     }
 
     /// Get donation details
@@ -395,7 +412,7 @@ impl SaviaContract {
             id: nft_id.clone(),
             owner,
             badge_type,
-            campaign_id: Some(campaign_id),
+            campaign_id,
             minted_at: env.ledger().timestamp(),
             metadata_uri: String::from_str(&env, "https://savia.org/nft/metadata"),
         };
@@ -434,7 +451,7 @@ impl SaviaContract {
         
         let campaign_bytes = Bytes::from_slice(&env, campaign_id.to_array().as_slice());
         let recipient_bytes = recipient.clone().to_xdr(&env);
-        let milestone_bytes = milestone.to_string().into_bytes();
+        let milestone_bytes = string_to_bytes(&milestone);
         
         hash_input.append(&campaign_bytes);
         hash_input.append(&recipient_bytes);
@@ -502,77 +519,99 @@ impl SaviaContract {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use soroban_sdk::{testutils::Address as _, Address, Env};
+    use alloc::boxed::Box;
+    use soroban_sdk::{testutils::Address as _, Address, Env, String};
+
+    /// One leaked Env shared by the client AND the test: Soroban panics with
+    /// "mis-tagged object reference" if objects cross Envs.
+    fn setup() -> (&'static Env, SaviaContractClient<'static>) {
+        let env: &'static Env = Box::leak(Box::new(Env::default()));
+        let contract_id = env.register_contract(None, SaviaContract);
+        let client = SaviaContractClient::new(env, &contract_id);
+        client.initialize(&200); // 2% platform fee (basis points / 100)
+        (env, client)
+    }
 
     #[test]
     fn test_initialize_contract() {
-        let env = Env::default();
-        let contract_id = env.register_contract(None, SaviaContract);
-        let client = SaviaContractClient::new(&env, &contract_id);
-
-        let result = client.initialize(&200);
-        assert!(result.is_ok());
+        // initialize() must succeed (no panic) and be idempotent-safe
+        let (_env, client) = setup();
+        client.initialize(&200);
     }
 
     #[test]
     fn test_create_campaign() {
-        let env = Env::default();
-        let contract_id = env.register_contract(None, SaviaContract);
-        let client = SaviaContractClient::new(&env, &contract_id);
+        let (env, client) = setup();
+        let beneficiary = Address::generate(env);
 
-        client.initialize(&200);
-
-        let beneficiary = Address::generate(&env);
-        let result = client.create_campaign(
+        let campaign_id = client.create_campaign(
             &beneficiary,
-            &String::from_str(&env, "Test Campaign"),
-            &String::from_str(&env, "A test campaign"),
-            &10000,
+            &String::from_str(env, "Test Campaign"),
+            &String::from_str(env, "A test campaign"),
+            &10_000,
             &30,
-            &String::from_str(&env, "Health"),
-            &String::from_str(&env, "Test City"),
+            &String::from_str(env, "Health"),
+            &String::from_str(env, "Test City"),
         );
 
-        assert!(result.is_ok());
-        let campaign_id = result.unwrap();
-        let campaign = client.get_campaign(&campaign_id);
-        assert!(campaign.is_some());
+        let campaign = client.get_campaign(&campaign_id).expect("campaign must exist");
+        assert_eq!(campaign.goal_amount, 10_000);
+        assert_eq!(campaign.current_amount, 0);
+        assert_eq!(campaign.verified, false);
+        assert_eq!(campaign.trust_score, 0);
     }
 
     #[test]
-    fn test_donation_flow() {
-        let env = Env::default();
-        let contract_id = env.register_contract(None, SaviaContract);
-        let client = SaviaContractClient::new(&env, &contract_id);
+    fn test_donation_applies_platform_fee() {
+        let (env, client) = setup();
+        let beneficiary = Address::generate(env);
+        let donor = Address::generate(env);
 
-        client.initialize(&200);
-
-        let beneficiary = Address::generate(&env);
-        let donor = Address::generate(&env);
-
-        // Create campaign
         let campaign_id = client.create_campaign(
             &beneficiary,
-            &String::from_str(&env, "Test Campaign"),
-            &String::from_str(&env, "A test campaign"),
-            &10000,
+            &String::from_str(env, "Test Campaign"),
+            &String::from_str(env, "desc"),
+            &10_000,
             &30,
-            &String::from_str(&env, "Health"),
-            &String::from_str(&env, "Test City"),
-        ).unwrap();
+            &String::from_str(env, "Health"),
+            &String::from_str(env, "Test City"),
+        );
 
-        // Make donation
-        let donation_id = client.donate(
+        // donate 1000 with the 2% fee → net 980 must reach the campaign
+        let (donation_id, minted_nft) = client.donate(
             &campaign_id,
             &donor,
-            &1000,
+            &1_000,
             &false,
-            &true,
-        ).unwrap();
+            &true, // mint NFT badge
+        );
 
-        // Verify donation
-        let donation = client.get_donation(&donation_id);
-        assert!(donation.is_some());
-        assert_eq!(donation.unwrap().amount, 980); // 1000 - 2% fee
+        let donation = client.get_donation(&donation_id).expect("donation must exist");
+        assert_eq!(donation.amount, 980);
+
+        let campaign = client.get_campaign(&campaign_id).expect("campaign must exist");
+        assert_eq!(campaign.current_amount, 980);
+
+        // the minted badge must exist and reference the campaign
+        let nft_id = minted_nft.expect("badge must have been minted");
+        let badge = client.get_nft(&nft_id).expect("badge must exist");
+        assert_eq!(badge.campaign_id, campaign_id);
+    }
+
+    #[test]
+    fn test_create_campaign_rejects_invalid_goal() {
+        let (env, client) = setup();
+        let beneficiary = Address::generate(env);
+        // goal_amount = 0 must fail (SaviaError::InvalidGoal)
+        let result = client.try_create_campaign(
+            &beneficiary,
+            &String::from_str(env, "Bad"),
+            &String::from_str(env, "Bad"),
+            &0,
+            &30,
+            &String::from_str(env, "Health"),
+            &String::from_str(env, "Test City"),
+        );
+        assert!(result.is_err());
     }
 }
